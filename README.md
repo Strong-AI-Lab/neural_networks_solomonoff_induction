@@ -91,6 +91,21 @@ We provide an example training script at `train.py`, which can be run with
 python train.py
 ```
 
+To switch positional encoding while keeping the rest of the setup the same:
+```
+# Baseline from the original code/paper setup (absolute sinusoidal encoding)
+python train.py --position_encoding_type=sinusoidal
+
+# Relative positional version (causal T5-style relative attention bias)
+python train.py --position_encoding_type=relative_bias
+```
+
+Useful relative-bias tuning flags:
+```
+--relative_attention_num_buckets=32
+--relative_attention_max_distance=128
+```
+
 The exact hyperparameters used to reproduce our results can be found in Table 1 and Appendix D of our [paper](https://arxiv.org/abs/2401.14953).
 
 

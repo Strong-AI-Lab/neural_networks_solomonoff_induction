@@ -41,6 +41,40 @@ class TransformerConfig:
   # How much larger the hidden layer of the feedforward network should be
   # compared to the `embedding_dim`.
   widening_factor: int = 4
+  # Positional mechanism used by the decoder.
+  # - "sinusoidal": absolute sinusoidal encodings (paper baseline).
+  # - "relative_bias": causal relative position bias on attention logits.
+  position_encoding_type: str = 'sinusoidal'
+  # Number of buckets for T5-style relative position bias.
+  relative_attention_num_buckets: int = 32
+  # Maximum distance for non-linear bucket scaling in relative bias.
+  relative_attention_max_distance: int = 128
+
+
+def _relative_position_bucket(
+    relative_position: jax.Array,
+    num_buckets: int,
+    max_distance: int,
+) -> jax.Array:
+  """Maps relative positions to logarithmic buckets (causal variant)."""
+  num_buckets_exact = num_buckets // 2
+  max_exact = num_buckets_exact
+  max_distance = max(max_distance, max_exact + 1)
+
+  # For causal attention, valid relative positions are <= 0 (k <= q).
+  distance = -relative_position
+  distance = jnp.maximum(distance, 0)
+
+  is_small = distance < max_exact
+  safe_distance = jnp.maximum(distance, 1)
+  log_scale = jnp.log(safe_distance / max_exact) / jnp.log(
+      max_distance / max_exact
+  )
+  large_bucket = max_exact + (
+      log_scale * (num_buckets - max_exact)
+  ).astype(jnp.int32)
+  large_bucket = jnp.minimum(large_bucket, num_buckets - 1)
+  return jnp.where(is_small, distance, large_bucket)
 
 
 class MultiHeadDotProductAttention(hk.Module):
@@ -50,6 +84,9 @@ class MultiHeadDotProductAttention(hk.Module):
       self,
       num_heads: int,
       num_hiddens_per_head: int,
+      use_relative_position_bias: bool = False,
+      relative_attention_num_buckets: int = 32,
+      relative_attention_max_distance: int = 128,
       name: str | None = None,
   ) -> None:
     """Initializes the attention module.
@@ -57,11 +94,39 @@ class MultiHeadDotProductAttention(hk.Module):
     Args:
       num_heads: Number of heads to use.
       num_hiddens_per_head: Number of hidden neurons per head.
+      use_relative_position_bias: Whether to add relative attention bias terms.
+      relative_attention_num_buckets: Number of relative position buckets.
+      relative_attention_max_distance: Max distance used by bucket mapping.
       name: Name of the module.
     """
     super().__init__(name=name)
     self._num_heads = num_heads
     self._num_hiddens_per_head = num_hiddens_per_head
+    self._use_relative_position_bias = use_relative_position_bias
+    self._relative_attention_num_buckets = relative_attention_num_buckets
+    self._relative_attention_max_distance = relative_attention_max_distance
+
+  def _relative_position_bias(
+      self,
+      query_length: int,
+      key_length: int,
+  ) -> jax.Array:
+    """Returns per-head relative attention bias, shape [1, H, Q, K]."""
+    query_positions = jnp.arange(query_length, dtype=jnp.int32)[:, None]
+    key_positions = jnp.arange(key_length, dtype=jnp.int32)[None, :]
+    relative_position = key_positions - query_positions
+    bucket = _relative_position_bucket(
+        relative_position=relative_position,
+        num_buckets=self._relative_attention_num_buckets,
+        max_distance=self._relative_attention_max_distance,
+    )
+    relative_attention_bias = hk.get_parameter(
+        'relative_attention_bias',
+        shape=(self._num_heads, self._relative_attention_num_buckets),
+        init=hk.initializers.TruncatedNormal(stddev=0.02),
+    )
+    values = jnp.take(relative_attention_bias, bucket, axis=1)
+    return values[None, ...]
 
   def __call__(
       self,
@@ -70,7 +135,8 @@ class MultiHeadDotProductAttention(hk.Module):
       mask: jax.Array | None = None,
   ) -> jax.Array:
     """Returns the output of the multi-head attention."""
-    batch_size, sequence_length, embedding_size = inputs_q.shape
+    batch_size, query_length, embedding_size = inputs_q.shape
+    _, key_length, _ = inputs_kv.shape
 
     num_hiddens = self._num_hiddens_per_head * self._num_heads
     q = hk.Linear(num_hiddens, with_bias=False)(inputs_q)
@@ -80,22 +146,29 @@ class MultiHeadDotProductAttention(hk.Module):
     # queries and keys/values when decoding. Also checking that the inputs have
     # the same batch size as the reshape below does not guarantee a failure if
     # they are different.
-    new_shape = (batch_size, -1, self._num_heads, self._num_hiddens_per_head)
-    q = jnp.reshape(q, new_shape)
-    k = jnp.reshape(k, new_shape)
-    v = jnp.reshape(v, new_shape)
+    q = jnp.reshape(
+        q, (batch_size, query_length, self._num_heads, self._num_hiddens_per_head)
+    )
+    k = jnp.reshape(
+        k, (batch_size, key_length, self._num_heads, self._num_hiddens_per_head)
+    )
+    v = jnp.reshape(
+        v, (batch_size, key_length, self._num_heads, self._num_hiddens_per_head)
+    )
 
-    # Let b=batch_size, t=seq_len, h=num_heads, and d=num_hiddens_per_head.
-    attention = jnp.einsum('bthd,bThd->bhtT', q, k)
+    # Let b=batch_size, q=query_length, k=key_length, h=num_heads, and d=dim.
+    attention = jnp.einsum('bqhd,bkhd->bhqk', q, k)
     attention *= 1.0 / jnp.sqrt(self._num_hiddens_per_head)
+    if self._use_relative_position_bias:
+      attention += self._relative_position_bias(query_length, key_length)
 
     if mask is not None:
       attention = jnp.where(mask, attention, jnp.finfo(jnp.float32).min)
 
     normalized_attention = jnn.softmax(attention)
 
-    output = jnp.einsum('bhtT,bThd->bthd', normalized_attention, v)
-    output = jnp.reshape(output, (batch_size, sequence_length, num_hiddens))
+    output = jnp.einsum('bhqk,bkhd->bqhd', normalized_attention, v)
+    output = jnp.reshape(output, (batch_size, query_length, num_hiddens))
     return hk.Linear(embedding_size, with_bias=False)(output)
 
 
@@ -147,6 +220,13 @@ def embed_sequences(
   embeddings = embeddings_layer(sequences)
   embeddings *= jnp.sqrt(config.embedding_dim)
 
+  if config.position_encoding_type == 'relative_bias':
+    return embeddings
+  if config.position_encoding_type != 'sinusoidal':
+    raise ValueError(
+        f'Unknown position_encoding_type: {config.position_encoding_type}'
+    )
+
   _, sequence_length, embedding_size = embeddings.shape
   pos_encodings = sinusoid_position_encoding(
       sequence_length=sequence_length,
@@ -177,6 +257,12 @@ def transformer_decoder(
     targets: The integer target values, shape [B, T].
     config: The config to use for the transformer.
   """
+  if config.embedding_dim % config.num_heads != 0:
+    raise ValueError(
+        'embedding_dim must be divisible by num_heads: '
+        f'{config.embedding_dim} vs {config.num_heads}'
+    )
+
   # Right shift the targets to get the inputs (the first token is now a 0).
   inputs = shift_right(targets)
 
@@ -187,7 +273,7 @@ def transformer_decoder(
 
   # The causal mask is shared across heads.
   causal_mask = np.tril(
-      np.ones((batch_size, 1, sequence_length, sequence_length))
+      np.ones((batch_size, 1, sequence_length, sequence_length), dtype=bool)
   )
 
   h = embeddings
@@ -195,6 +281,10 @@ def transformer_decoder(
     self_attention = MultiHeadDotProductAttention(
         num_heads=config.num_heads,
         num_hiddens_per_head=config.embedding_dim // config.num_heads,
+        use_relative_position_bias=config.position_encoding_type
+        == 'relative_bias',
+        relative_attention_num_buckets=config.relative_attention_num_buckets,
+        relative_attention_max_distance=config.relative_attention_max_distance,
     )(inputs_q=h, inputs_kv=h, mask=causal_mask)
     attention = layer_norm(h + self_attention)
 
