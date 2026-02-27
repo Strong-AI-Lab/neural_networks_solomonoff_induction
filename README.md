@@ -1,6 +1,10 @@
 # Learning Universal Predictors
 
-This repository provides an implementation of our ICML 2024 paper [Learning Universal Predictors](https://arxiv.org/abs/2401.14953).
+> **Fork Notice:** This is a fork of [google-deepmind/neural_networks_solomonoff_induction](https://github.com/google-deepmind/neural_networks_solomonoff_induction)
+> maintained at [Strong-AI-Lab/neural_networks_solomonoff_induction](https://github.com/Strong-AI-Lab/neural_networks_solomonoff_induction).
+> See [Changes from Original](#changes-from-original) for details.
+
+This repository provides an implementation of the ICML 2024 paper [Learning Universal Predictors](https://arxiv.org/abs/2401.14953).
 
 > Meta-learning has emerged as a powerful approach to train neural networks to learn new tasks quickly from limited data.
 Broad exposure to different tasks leads to versatile representations enabling general problem solving.
@@ -20,17 +24,18 @@ It is based on [JAX](https://jax.readthedocs.io) and [Haiku](https://dm-haiku.re
 .
 ├── data
 |   ├── chomsky_data_generator.py - Chomsky Task Source, for a single task.
-|   ├── ctw_data_generator.py.    - Variable-order Markov Source.
+|   ├── ctw_data_generator.py     - Variable-order Markov Source.
 |   ├── data_generator.py         - Main abstract class for our data generators.
 |   ├── meta_data_generator.py    - Sampling from multiple generators.
 |   ├── utm_data_generator.py     - BrainPhoque UTM Source, from randomly sampled programs.
 |   └── utms.py                   - UTM interface and implementation of BrainPhoque.
 ├── models
 |   ├── ctw.py                    - CTW (Willems, 1995)
-|   └── transformer.py            - Decoder-only Transformer (Vaswani, 2017).
+|   └── transformer.py            - Decoder-only Transformer (Vaswani, 2017). [modified]
+├── evaluate.py                   - Script to evaluate a trained model. [added]
 ├── README.md
 ├── requirements.txt              - Dependencies
-└── train.py                      - Script to train a neural model.
+└── train.py                      - Script to train a neural model. [modified]
 ```
 
 
@@ -106,7 +111,34 @@ Useful relative-bias tuning flags:
 --relative_attention_max_distance=128
 ```
 
-The exact hyperparameters used to reproduce our results can be found in Table 1 and Appendix D of our [paper](https://arxiv.org/abs/2401.14953).
+The exact hyperparameters used to reproduce our results can be found in Table 1 and Appendix D of the [paper](https://arxiv.org/abs/2401.14953).
+
+To evaluate a trained model, use `evaluate.py`:
+```
+python evaluate.py --params_path=params.npz
+```
+
+Key flags:
+```
+--data_source          # utm (default), ctw, or chomsky
+--eval_seq_lengths     # comma-separated sequence lengths, e.g. 256,1024
+--num_eval_sequences   # total sequences per length (default: 6000)
+--position_encoding_type  # sinusoidal (default) or relative_bias
+--compute_ctw_regret   # if True, also evaluate CTW and report regret
+--position_metrics_csv # optional path to write per-position metrics CSV
+```
+
+The model architecture flags (`--embedding_dim`, `--num_layers`, `--num_heads`, etc.) must match those used during training.
+
+
+## Changes from Original
+
+The following changes have been made relative to [google-deepmind/neural_networks_solomonoff_induction](https://github.com/google-deepmind/neural_networks_solomonoff_induction):
+
+- **`models/transformer.py`**: Added support for causal T5-style relative attention bias as an alternative to the original sinusoidal positional encoding, selectable via `--position_encoding_type=relative_bias`.
+- **`train.py`**: Refactored with additional flags to support the new positional encoding options.
+- **`evaluate.py`** *(new)*: Script to evaluate a trained model on UTM, CTW, or Chomsky sequences. Reports per-position NLL and optionally computes regret against a CTW baseline.
+- **`data/solomonoff.py`** *(new)*: `SolomonoffInductor` class that estimates the Solomonoff mixture distribution over next symbols using the BrainPhoque UTM.
 
 
 ## Citing This Work
